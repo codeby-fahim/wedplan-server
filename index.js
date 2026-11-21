@@ -970,32 +970,7 @@ app.get("/customer/bookings", verifyToken, verifyCustomer, async (req, res) => {
   }
 });
 
-// Admin Test
-app.get("/admin", verifyToken, verifyAdmin, (req, res) => {
-  res.json({
-    success: true,
-    message: "Welcome Admin!",
-    user: req.user,
-  });
-});
 
-// Vendor Test
-app.get("/vendor", verifyToken, verifyVendor, (req, res) => {
-  res.json({
-    success: true,
-    message: "Welcome Vendor!",
-    user: req.user,
-  });
-});
-
-// Customer Test
-app.get("/customer", verifyToken, verifyCustomer, (req, res) => {
-  res.json({
-    success: true,
-    message: "Welcome Customer!",
-    user: req.user,
-  });
-});
 
 // ========================================
 // Fallback error / 404 handlers
