@@ -9,12 +9,71 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 const app = express();
 const CLIENT_ORIGIN = process.env.CLIENT_URL || "http://localhost:3000";
 app.use(cors({ origin: CLIENT_ORIGIN, credentials: true }));
-app.use(express.json({ limit: "1mb" }));
 
 const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
   : null;
 const PORT = process.env.PORT || 5000;
+
+// Stripe needs the raw body to verify signatures, so this route must be
+// registered BEFORE express.json() parses every other request.
+app.post(
+  "/webhooks/stripe",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
+      return res.status(503).json({ success: false, message: "Webhook not configured." });
+    }
+
+    const signature = req.headers["stripe-signature"];
+    if (!signature) {
+      return res.status(400).json({ success: false, message: "Missing Stripe signature." });
+    }
+
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (error) {
+      console.error("Stripe webhook verification failed:", error);
+      return res.status(400).json({ success: false, message: "Invalid signature." });
+    }
+
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+      const vendorId = session.metadata?.vendorId;
+      const paid =
+        session.payment_status === "paid" ||
+        session.payment_status === "no_payment_required";
+
+      if (paid && vendorId && ObjectId.isValid(vendorId)) {
+        await userCollection.updateOne(
+          { _id: new ObjectId(vendorId) },
+          { $set: { subscriptionPlan: "premium", subscriptionExpiresAt: null } }
+        );
+      }
+    }
+
+    if (event.type === "customer.subscription.deleted") {
+      const subscription = event.data.object;
+      const vendorId = subscription.metadata?.vendorId;
+
+      if (vendorId && ObjectId.isValid(vendorId)) {
+        await userCollection.updateOne(
+          { _id: new ObjectId(vendorId) },
+          { $set: { subscriptionPlan: "free", subscriptionExpiresAt: null } }
+        );
+      }
+    }
+
+    return res.json({ received: true });
+  }
+);
+
+app.use(express.json({ limit: "1mb" }));
 
 // MongoDB connection
 const client = new MongoClient(process.env.MONGODB_URL);
@@ -237,7 +296,7 @@ function serializeService(service) {
 async function withVendorInfo(service) {
   const vendor = await userCollection.findOne(
     { _id: service.vendorId },
-    { projection: { name: 1, businessName: 1, image: 1 } }
+    { projection: { name: 1, businessName: 1, image: 1, subscriptionPlan: 1 } }
   );
 
   return {
@@ -247,6 +306,7 @@ async function withVendorInfo(service) {
           name: vendor.name ?? null,
           businessName: vendor.businessName ?? null,
           image: vendor.image ?? null,
+          subscriptionPlan: vendor.subscriptionPlan ?? "free",
         }
       : null,
   };
@@ -465,6 +525,101 @@ app.get("/vendor/stats", verifyToken, verifyVendor, async (req, res) => {
     });
   }
 });
+
+// Create a Stripe sandbox Checkout session for the Premium plan.
+app.post(
+  "/vendor/subscription/checkout",
+  verifyToken,
+  verifyVendor,
+  async (req, res) => {
+    try {
+      if (!stripe || !process.env.STRIPE_PREMIUM_PRICE_ID) {
+        return res.status(503).json({
+          success: false,
+          message: "Payments are not configured on the server.",
+        });
+      }
+
+      const session = await stripe.checkout.sessions.create({
+        // The configured price is recurring, so this must be subscription mode.
+        mode: "subscription",
+        line_items: [
+          { price: process.env.STRIPE_PREMIUM_PRICE_ID, quantity: 1 },
+        ],
+        customer_email: req.user.email,
+        client_reference_id: req.user.id,
+        metadata: { vendorId: req.user.id },
+        subscription_data: { metadata: { vendorId: req.user.id } },
+        success_url: `${CLIENT_ORIGIN}/dashboard/vendor/subscription?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${CLIENT_ORIGIN}/dashboard/vendor/subscription?payment=cancelled`,
+      });
+
+      return res.json({ success: true, url: session.url });
+    } catch (error) {
+      console.error("Stripe checkout failed:", error);
+      return res.status(500).json({
+        success: false,
+        message:
+          error?.message && process.env.NODE_ENV !== "production"
+            ? `Stripe: ${error.message}`
+            : "Could not start checkout. Please try again.",
+      });
+    }
+  }
+);
+
+// Fallback for local sandbox testing when no webhook is forwarding events.
+// The session is fetched from Stripe and the metadata must match this vendor.
+app.get(
+  "/vendor/subscription/verify",
+  verifyToken,
+  verifyVendor,
+  async (req, res) => {
+    try {
+      const sessionId = req.query.sessionId;
+
+      if (typeof sessionId !== "string" || !sessionId || !stripe) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid checkout session.",
+        });
+      }
+
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+      const paid =
+        session.payment_status === "paid" ||
+        session.payment_status === "no_payment_required";
+
+      if (
+        !paid ||
+        !session.subscription ||
+        session.metadata?.vendorId !== req.user.id
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Payment has not been completed for this account.",
+        });
+      }
+
+      await userCollection.updateOne(
+        { _id: new ObjectId(req.user.id) },
+        { $set: { subscriptionPlan: "premium", subscriptionExpiresAt: null } }
+      );
+
+      return res.json({
+        success: true,
+        message: "Premium plan activated.",
+      });
+    } catch (error) {
+      console.error("Payment verification failed:", error);
+      return res.status(500).json({
+        success: false,
+        message: "Could not verify your payment. Please try again.",
+      });
+    }
+  }
+);
 
 // Single owned service (used by the edit form)
 app.get("/vendor/services/:id", verifyToken, verifyVendor, async (req, res) => {
