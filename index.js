@@ -6,6 +6,27 @@ import { MongoClient, ObjectId } from "mongodb";
 import Stripe from "stripe";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
+for (const name of ["MONGODB_URL", "BETTER_AUTH_URL"]) {
+  if (!process.env[name] || !process.env[name].trim()) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+}
+
+async function safeIndex(collection, keys, options) {
+  try {
+    await collection.createIndex(keys, options);
+  } catch (error) {
+    // Index creation can fail on legacy data; never block server startup.
+    console.warn(`Could not create index on ${collection.collectionName}:`, error.message);
+  }
+}
+
+function isValidObjectId(value) {
+  return (
+    typeof value === "string" && /^[0-9a-fA-F]{24}$/.test(value)
+  );
+}
+
 const app = express();
 const CLIENT_ORIGIN = process.env.CLIENT_URL || "http://localhost:3000";
 app.use(cors({ origin: CLIENT_ORIGIN, credentials: true }));
@@ -49,7 +70,7 @@ app.post(
         session.payment_status === "paid" ||
         session.payment_status === "no_payment_required";
 
-      if (paid && vendorId && ObjectId.isValid(vendorId)) {
+      if (paid && vendorId && isValidObjectId(vendorId)) {
         await activatePremium(vendorId, session);
       }
     }
@@ -67,6 +88,9 @@ app.post(
           subscription,
           subscription.status === "past_due" ? "past_due" : "expired"
         );
+      } else if (subscription.status === "active") {
+        // A recovered payment (or trial conversion) restores Premium.
+        await reactivatePremium(subscription);
       }
     }
 
@@ -109,28 +133,25 @@ const servicesCollection = db.collection("services");
 const bookingsCollection = db.collection("bookings");
 const transactionsCollection = db.collection("transactions");
 
-await servicesCollection.createIndex({ vendorId: 1, createdAt: -1 });
-await servicesCollection.createIndex({ status: 1, isActive: 1 });
-await bookingsCollection.createIndex({ vendorId: 1, status: 1, createdAt: -1 });
-await bookingsCollection.createIndex({ customerId: 1, createdAt: -1 });
-await bookingsCollection.createIndex({ serviceId: 1 });
+await safeIndex(servicesCollection, { vendorId: 1, createdAt: -1 });
+await safeIndex(servicesCollection, { status: 1, isActive: 1 });
+await safeIndex(bookingsCollection, { vendorId: 1, status: 1, createdAt: -1 });
+await safeIndex(bookingsCollection, { customerId: 1, createdAt: -1 });
+await safeIndex(bookingsCollection, { serviceId: 1 });
 // One active request per customer + service. Cancelled records are deleted,
 // and rejected requests lose isActiveRequest, so neither blocks a new one.
-try {
-  await bookingsCollection.createIndex(
-    { customerId: 1, serviceId: 1 },
-    { unique: true, partialFilterExpression: { isActiveRequest: true } }
-  );
-} catch (error) {
-  // Legacy duplicate data must not prevent the server from starting.
-  console.warn("Could not create booking uniqueness index:", error.message);
-}
-await transactionsCollection.createIndex({ bookingId: 1, createdAt: -1 });
-await transactionsCollection.createIndex(
+await safeIndex(
+  bookingsCollection,
+  { customerId: 1, serviceId: 1 },
+  { unique: true, partialFilterExpression: { isActiveRequest: true } }
+);
+await safeIndex(transactionsCollection, { bookingId: 1, createdAt: -1 });
+await safeIndex(
+  transactionsCollection,
   { stripeSessionId: 1 },
   { unique: true, sparse: true }
 );
-await userCollection.createIndex({ role: 1 });
+await safeIndex(userCollection, { role: 1 });
 
 // ========================================
 // JWT Authentication Configuration
@@ -141,10 +162,12 @@ const JWKS = createRemoteJWKSet(
 );
 
 // The client's jwt() plugin must sign with these same values.
+// Fail closed: if the env vars are missing, use the same values the client
+// signs with instead of silently skipping issuer/audience verification.
 const jwtVerifyOptions = {
   algorithms: ["EdDSA"],
-  ...(process.env.JWT_ISSUER ? { issuer: process.env.JWT_ISSUER } : {}),
-  ...(process.env.JWT_AUDIENCE ? { audience: process.env.JWT_AUDIENCE } : {}),
+  issuer: process.env.JWT_ISSUER || "wedplan-server",
+  audience: process.env.JWT_AUDIENCE || "wedplan-client",
 };
 
 // ========================================
@@ -180,7 +203,7 @@ const verifyToken = async (req, res, next) => {
 
     const userId = payload.sub;
 
-    if (typeof userId !== "string" || !ObjectId.isValid(userId)) {
+    if (typeof userId !== "string" || !isValidObjectId(userId)) {
       return res.status(401).json({
         success: false,
         message: "Invalid user identity.",
@@ -304,6 +327,11 @@ app.get("/", (req, res) => {
 const MAX_SERVICE_IMAGES = 3;
 const SERVICE_CATEGORIES = [
   "Photography & Videography",
+  "Wedding Venues",
+  "Decoration & Florist",
+  "Catering Services",
+  "Makeup & Styling",
+  "Wedding Fashion",
   "Venue & Decoration",
   "Catering & Cake",
   "Bridal & Grooming",
@@ -312,6 +340,21 @@ const SERVICE_CATEGORIES = [
   "Transport & Logistics",
   "Other",
 ];
+
+// Display categories from the homepage can match legacy stored values too.
+const CATEGORY_ALIASES = {
+  "Wedding Venues": ["Wedding Venues", "Venue & Decoration"],
+  "Decoration & Florist": ["Decoration & Florist", "Venue & Decoration"],
+  "Catering Services": ["Catering Services", "Catering & Cake"],
+  "Makeup & Styling": ["Makeup & Styling", "Bridal & Grooming"],
+  "Wedding Fashion": ["Wedding Fashion", "Bridal & Grooming"],
+};
+
+function categoryValues(value) {
+  return (CATEGORY_ALIASES[value] ?? [value]).filter((item) =>
+    SERVICE_CATEGORIES.includes(item)
+  );
+}
 
 function serializeService(service) {
   const { _id, ...rest } = service;
@@ -420,9 +463,20 @@ function serializeTransaction(transaction) {
 
 // Called ONLY from verified Stripe webhook events — never from the browser.
 async function activatePremium(vendorId, session) {
+  const subscriptionId =
+    typeof session.subscription === "string"
+      ? session.subscription
+      : (session.subscription?.id ?? null);
+
   await userCollection.updateOne(
     { _id: new ObjectId(vendorId) },
-    { $set: { subscriptionPlan: "premium", subscriptionExpiresAt: null } }
+    {
+      $set: {
+        subscriptionPlan: "premium",
+        subscriptionExpiresAt: null,
+        ...(subscriptionId ? { currentStripeSubscriptionId: subscriptionId } : {}),
+      },
+    }
   );
 
   await transactionsCollection.updateOne(
@@ -430,29 +484,68 @@ async function activatePremium(vendorId, session) {
     {
       $set: {
         status: "paid",
-        stripeSubscriptionId:
-          typeof session.subscription === "string"
-            ? session.subscription
-            : (session.subscription?.id ?? null),
+        ...(subscriptionId ? { stripeSubscriptionId: subscriptionId } : {}),
       },
     }
   );
 }
 
-async function deactivatePremium(subscription, statusValue) {
+// Restores Premium when Stripe reports a previously failed subscription as
+// active again. Guarded so a stale subscription can't overwrite a newer one.
+async function reactivatePremium(subscription) {
   const vendorId = subscription.metadata?.vendorId;
-  if (!vendorId || !ObjectId.isValid(vendorId)) return;
+  if (!vendorId || !isValidObjectId(vendorId)) return;
+
+  const user = await userCollection.findOne(
+    { _id: new ObjectId(vendorId) },
+    { projection: { currentStripeSubscriptionId: 1 } }
+  );
+
+  if (
+    user?.currentStripeSubscriptionId &&
+    user.currentStripeSubscriptionId !== subscription.id
+  ) {
+    return;
+  }
 
   await userCollection.updateOne(
     { _id: new ObjectId(vendorId) },
-    { $set: { subscriptionPlan: "free", subscriptionExpiresAt: new Date() } }
+    {
+      $set: {
+        subscriptionPlan: "premium",
+        subscriptionExpiresAt: null,
+        currentStripeSubscriptionId: subscription.id,
+      },
+    }
   );
 
-  await transactionsCollection.updateMany(
+  // Only the transaction for this subscription changes — never history.
+  await transactionsCollection.updateOne(
+    { stripeSubscriptionId: subscription.id },
+    { $set: { status: "paid" } }
+  );
+}
+
+async function deactivatePremium(subscription, statusValue) {
+  // Only the currently active subscription may downgrade this vendor. A
+  // late/retried event for an older subscription is ignored entirely.
+  const vendor = await userCollection.findOne({
+    currentStripeSubscriptionId: subscription.id,
+  });
+
+  if (!vendor) return;
+
+  await userCollection.updateOne(
+    { _id: vendor._id },
     {
-      vendorId: new ObjectId(vendorId),
-      status: { $in: ["paid", "pending"] },
-    },
+      $set: { subscriptionPlan: "free", subscriptionExpiresAt: new Date() },
+      $unset: { currentStripeSubscriptionId: "" },
+    }
+  );
+
+  // Update only the affected record; historical transactions stay immutable.
+  await transactionsCollection.updateOne(
+    { stripeSubscriptionId: subscription.id },
     { $set: { status: statusValue } }
   );
 }
@@ -480,7 +573,7 @@ function validateBookingPayload(body) {
   const validDate =
     typeof rawDate === "string" && !Number.isNaN(eventDate.getTime());
 
-  if (!ObjectId.isValid(serviceId)) errors.push("A valid service is required.");
+  if (!isValidObjectId(serviceId)) errors.push("A valid service is required.");
   if (!validDate) errors.push("A valid event date is required.");
   if (!eventLocation) errors.push("Event location is required.");
   else if (eventLocation.length > 160)
@@ -635,7 +728,7 @@ app.post(
         metadata: { vendorId: req.user.id },
         subscription_data: { metadata: { vendorId: req.user.id } },
         success_url: `${CLIENT_ORIGIN}/dashboard/vendor/subscription/success?session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${CLIENT_ORIGIN}/dashboard/vendor/subscription?payment=cancelled`,
+        cancel_url: `${CLIENT_ORIGIN}/dashboard/vendor/subscription/cancel`,
       });
 
       // Record a pending transaction. Only a verified webhook can move it
@@ -663,7 +756,7 @@ app.post(
       return res.status(500).json({
         success: false,
         message:
-          error?.message && process.env.NODE_ENV !== "production"
+          error?.message && process.env.EXPOSE_ERROR_DETAILS === "true"
             ? `Stripe: ${error.message}`
             : "Could not start checkout. Please try again.",
       });
@@ -716,7 +809,7 @@ app.get(
 app.get("/vendor/services/:id", verifyToken, verifyVendor, async (req, res) => {
   try {
     const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
+    if (!isValidObjectId(id)) {
       return res.status(400).json({ success: false, message: "Invalid service id." });
     }
 
@@ -743,7 +836,7 @@ app.get("/vendor/services/:id", verifyToken, verifyVendor, async (req, res) => {
 app.patch("/vendor/services/:id", verifyToken, verifyVendor, async (req, res) => {
   try {
     const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
+    if (!isValidObjectId(id)) {
       return res.status(400).json({ success: false, message: "Invalid service id." });
     }
 
@@ -789,7 +882,7 @@ app.patch("/vendor/services/:id", verifyToken, verifyVendor, async (req, res) =>
 app.delete("/vendor/services/:id", verifyToken, verifyVendor, async (req, res) => {
   try {
     const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
+    if (!isValidObjectId(id)) {
       return res.status(400).json({ success: false, message: "Invalid service id." });
     }
 
@@ -825,7 +918,7 @@ app.patch(
       const { id } = req.params;
       const isActive = req.body?.isActive;
 
-      if (!ObjectId.isValid(id)) {
+      if (!isValidObjectId(id)) {
         return res.status(400).json({ success: false, message: "Invalid service id." });
       }
       if (typeof isActive !== "boolean") {
@@ -912,7 +1005,7 @@ app.patch(
       const { id } = req.params;
       const status = req.body?.status;
 
-      if (!ObjectId.isValid(id)) {
+      if (!isValidObjectId(id)) {
         return res.status(400).json({ success: false, message: "Invalid booking id." });
       }
       if (!["accepted", "rejected"].includes(status)) {
@@ -974,7 +1067,9 @@ app.get("/admin/services", verifyToken, verifyAdmin, async (req, res) => {
 
     const filter = {};
     if (search) filter.serviceName = { $regex: escapeRegex(search), $options: "i" };
-    if (category && SERVICE_CATEGORIES.includes(category)) filter.category = category;
+    if (category && categoryValues(category).length) {
+      filter.category = { $in: categoryValues(category) };
+    }
     if (["pending", "approved", "rejected"].includes(status)) filter.status = status;
     if (location) filter.location = { $regex: escapeRegex(location), $options: "i" };
 
@@ -1005,7 +1100,7 @@ app.patch(
       const { id } = req.params;
       const status = req.body?.status;
 
-      if (!ObjectId.isValid(id)) {
+      if (!isValidObjectId(id)) {
         return res.status(400).json({
           success: false,
           message: "Invalid service id.",
@@ -1073,7 +1168,7 @@ app.patch(
 app.delete("/admin/services/:id", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
+    if (!isValidObjectId(id)) {
       return res.status(400).json({ success: false, message: "Invalid service id." });
     }
 
@@ -1194,7 +1289,7 @@ app.patch(
       const { id } = req.params;
       const isBlocked = req.body?.isBlocked;
 
-      if (!ObjectId.isValid(id)) {
+      if (!isValidObjectId(id)) {
         return res.status(400).json({ success: false, message: "Invalid user id." });
       }
       if (typeof isBlocked !== "boolean") {
@@ -1285,7 +1380,7 @@ app.get("/admin/transactions", verifyToken, verifyAdmin, async (req, res) => {
           vendorEmail: vendor?.email ?? null,
           plan: transaction.plan ?? transaction.subscriptionPlan ?? "premium",
           amount: transaction.amount ?? 0,
-          currency: transaction.currency ?? "usd",
+          currency: transaction.currency ?? "bdt",
           status: transaction.status ?? transaction.paymentStatus ?? "pending",
           createdAt:
             transaction.createdAt ?? transaction.transactionDate ?? null,
@@ -1305,6 +1400,28 @@ function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// Homepage featured services — strictly approved + active, newest first.
+app.get("/featured-services", async (req, res) => {
+  try {
+    const services = await servicesCollection
+      .find({ status: "approved", isActive: true })
+      .sort({ createdAt: -1 })
+      .limit(6)
+      .toArray();
+
+    return res.json({
+      success: true,
+      services: await Promise.all(services.map(withVendorInfo)),
+    });
+  } catch (error) {
+    console.error("Fetch featured services failed:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Could not load featured services. Please try again.",
+    });
+  }
+});
+
 // Public discovery: only approved, active services.
 // Search, category and location filtering all happen here in the database.
 app.get("/services", async (req, res) => {
@@ -1316,23 +1433,30 @@ app.get("/services", async (req, res) => {
     const location = queryValue("location");
     const requestedCategory = queryValue("category");
 
-    // Show everything vendors have published except rejected services.
-    // Pending listings are visible but cannot be booked until approved.
-    const filter = { status: { $in: ["pending", "approved"] }, isActive: true };
+    // Only approved AND active services are visible to the public.
+    const filter = { status: "approved", isActive: true };
 
     if (search) {
       filter.serviceName = { $regex: escapeRegex(search), $options: "i" };
     }
-    if (SERVICE_CATEGORIES.includes(requestedCategory)) {
-      filter.category = requestedCategory;
+    if (categoryValues(requestedCategory).length) {
+      filter.category = { $in: categoryValues(requestedCategory) };
     }
     if (location) {
       filter.location = { $regex: escapeRegex(location), $options: "i" };
     }
 
+    const sortOption = queryValue("sort");
+    const sortSpec =
+      sortOption === "price_asc"
+        ? { price: 1 }
+        : sortOption === "price_desc"
+          ? { price: -1 }
+          : { createdAt: -1 };
+
     const services = await servicesCollection
       .find(filter)
-      .sort({ createdAt: -1 })
+      .sort(sortSpec)
       .limit(50)
       .toArray();
 
@@ -1349,17 +1473,17 @@ app.get("/services", async (req, res) => {
   }
 });
 
-// Public service detail — rejected and paused services stay hidden
+// Public service detail — only approved and active services are exposed
 app.get("/services/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
+    if (!isValidObjectId(id)) {
       return res.status(400).json({ success: false, message: "Invalid service id." });
     }
 
     const service = await servicesCollection.findOne({
       _id: new ObjectId(id),
-      status: { $in: ["pending", "approved"] },
+      status: "approved",
       isActive: true,
     });
 
@@ -1398,9 +1522,8 @@ app.post("/bookings", verifyToken, verifyCustomer, async (req, res) => {
 
     const service = await servicesCollection.findOne({
       _id: new ObjectId(value.serviceId),
-      // Pending services are browsable, so customers may request them too.
-      // Rejected or paused services can never be booked.
-      status: { $in: ["pending", "approved"] },
+      // Only approved and active services can be booked.
+      status: "approved",
       isActive: true,
     });
 
@@ -1411,20 +1534,13 @@ app.post("/bookings", verifyToken, verifyCustomer, async (req, res) => {
       });
     }
 
-    if (
-      req.user.role === "vendor" &&
-      service.vendorId.toString() === req.user.id
-    ) {
-      return res.status(403).json({
-        success: false,
-        message: "You cannot book your own service.",
-      });
-    }
+    // verifyCustomer already rejects vendors/admins, so only customers reach
+    // this point. Own-bookings are therefore impossible by role.
 
     const eventDateKey = value.eventDate.toISOString().slice(0, 10);
     const customerId = new ObjectId(req.user.id);
 
-    // Reject a second active request for the same service and event date.
+    // Reject a second active request for the same service (one at a time).
     const duplicate = await bookingsCollection.findOne({
       customerId,
       serviceId: service._id,
@@ -1553,7 +1669,7 @@ app.delete(
     try {
       const { id } = req.params;
 
-      if (!ObjectId.isValid(id)) {
+      if (!isValidObjectId(id)) {
         return res.status(400).json({
           success: false,
           message: "Invalid booking id.",
