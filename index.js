@@ -50,23 +50,35 @@ app.post(
         session.payment_status === "no_payment_required";
 
       if (paid && vendorId && ObjectId.isValid(vendorId)) {
-        await userCollection.updateOne(
-          { _id: new ObjectId(vendorId) },
-          { $set: { subscriptionPlan: "premium", subscriptionExpiresAt: null } }
-        );
-        await recordPremiumPayment(session, vendorId);
+        await activatePremium(vendorId, session);
       }
     }
 
     if (event.type === "customer.subscription.deleted") {
-      const subscription = event.data.object;
-      const vendorId = subscription.metadata?.vendorId;
+      await deactivatePremium(event.data.object, "cancelled");
+    }
 
-      if (vendorId && ObjectId.isValid(vendorId)) {
-        await userCollection.updateOne(
-          { _id: new ObjectId(vendorId) },
-          { $set: { subscriptionPlan: "free", subscriptionExpiresAt: null } }
+    if (event.type === "customer.subscription.updated") {
+      const subscription = event.data.object;
+      const failedStatuses = ["canceled", "unpaid", "incomplete_expired", "past_due"];
+
+      if (failedStatuses.includes(subscription.status)) {
+        await deactivatePremium(
+          subscription,
+          subscription.status === "past_due" ? "past_due" : "expired"
         );
+      }
+    }
+
+    if (event.type === "invoice.payment_failed") {
+      const invoice = event.data.object;
+      if (invoice.subscription) {
+        const subscription = await stripe.subscriptions.retrieve(
+          typeof invoice.subscription === "string"
+            ? invoice.subscription
+            : invoice.subscription.id
+        );
+        await deactivatePremium(subscription, "past_due");
       }
     }
 
@@ -102,12 +114,17 @@ await servicesCollection.createIndex({ status: 1, isActive: 1 });
 await bookingsCollection.createIndex({ vendorId: 1, status: 1, createdAt: -1 });
 await bookingsCollection.createIndex({ customerId: 1, createdAt: -1 });
 await bookingsCollection.createIndex({ serviceId: 1 });
-// One active request per customer + service + event date. Cancelled/rejected
-// requests are excluded from this unique index via isActiveRequest.
-await bookingsCollection.createIndex(
-  { customerId: 1, serviceId: 1, eventDateKey: 1 },
-  { unique: true, partialFilterExpression: { isActiveRequest: true } }
-);
+// One active request per customer + service. Cancelled records are deleted,
+// and rejected requests lose isActiveRequest, so neither blocks a new one.
+try {
+  await bookingsCollection.createIndex(
+    { customerId: 1, serviceId: 1 },
+    { unique: true, partialFilterExpression: { isActiveRequest: true } }
+  );
+} catch (error) {
+  // Legacy duplicate data must not prevent the server from starting.
+  console.warn("Could not create booking uniqueness index:", error.message);
+}
 await transactionsCollection.createIndex({ bookingId: 1, createdAt: -1 });
 await transactionsCollection.createIndex(
   { stripeSessionId: 1 },
@@ -401,30 +418,42 @@ function serializeTransaction(transaction) {
   };
 }
 
-// Records a successful Premium payment exactly once — webhook and the
-// success-page verification can both call this safely.
-async function recordPremiumPayment(session, vendorId) {
+// Called ONLY from verified Stripe webhook events — never from the browser.
+async function activatePremium(vendorId, session) {
+  await userCollection.updateOne(
+    { _id: new ObjectId(vendorId) },
+    { $set: { subscriptionPlan: "premium", subscriptionExpiresAt: null } }
+  );
+
   await transactionsCollection.updateOne(
     { stripeSessionId: session.id },
     {
-      $setOnInsert: {
-        vendorId: new ObjectId(vendorId),
-        subscriptionPlan: "premium",
-        amount: session.amount_total ?? 0,
-        currency: session.currency ?? "usd",
-        paymentStatus: "paid",
-        transactionDate: new Date(),
-        stripeSessionId: session.id,
+      $set: {
+        status: "paid",
         stripeSubscriptionId:
           typeof session.subscription === "string"
             ? session.subscription
             : (session.subscription?.id ?? null),
-        customerEmail:
-          session.customer_email ?? session.customer_details?.email ?? null,
-        createdAt: new Date(),
       },
+    }
+  );
+}
+
+async function deactivatePremium(subscription, statusValue) {
+  const vendorId = subscription.metadata?.vendorId;
+  if (!vendorId || !ObjectId.isValid(vendorId)) return;
+
+  await userCollection.updateOne(
+    { _id: new ObjectId(vendorId) },
+    { $set: { subscriptionPlan: "free", subscriptionExpiresAt: new Date() } }
+  );
+
+  await transactionsCollection.updateMany(
+    {
+      vendorId: new ObjectId(vendorId),
+      status: { $in: ["paid", "pending"] },
     },
-    { upsert: true }
+    { $set: { status: statusValue } }
   );
 }
 
@@ -588,6 +617,13 @@ app.post(
         });
       }
 
+      if (isPremium(req.user)) {
+        return res.status(400).json({
+          success: false,
+          message: "You are already on the Premium plan.",
+        });
+      }
+
       const session = await stripe.checkout.sessions.create({
         // The configured price is recurring, so this must be subscription mode.
         mode: "subscription",
@@ -598,9 +634,28 @@ app.post(
         client_reference_id: req.user.id,
         metadata: { vendorId: req.user.id },
         subscription_data: { metadata: { vendorId: req.user.id } },
-        success_url: `${CLIENT_ORIGIN}/dashboard/vendor/subscription?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+        success_url: `${CLIENT_ORIGIN}/dashboard/vendor/subscription/success?session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${CLIENT_ORIGIN}/dashboard/vendor/subscription?payment=cancelled`,
       });
+
+      // Record a pending transaction. Only a verified webhook can move it
+      // to "paid" — the browser redirect has no power over this record.
+      await transactionsCollection.updateOne(
+        { stripeSessionId: session.id },
+        {
+          $setOnInsert: {
+            vendorId: new ObjectId(req.user.id),
+            plan: "premium",
+            amount: 999,
+            currency: "bdt",
+            stripeSessionId: session.id,
+            stripeSubscriptionId: null,
+            status: "pending",
+            createdAt: new Date(),
+          },
+        },
+        { upsert: true }
+      );
 
       return res.json({ success: true, url: session.url });
     } catch (error) {
@@ -616,55 +671,42 @@ app.post(
   }
 );
 
-// Fallback for local sandbox testing when no webhook is forwarding events.
-// The session is fetched from Stripe and the metadata must match this vendor.
+// Read-only status for the success page. This never changes a plan or a
+// transaction — it only reports what webhooks have already confirmed.
 app.get(
-  "/vendor/subscription/verify",
+  "/vendor/subscription/status",
   verifyToken,
   verifyVendor,
   async (req, res) => {
     try {
-      const sessionId = req.query.sessionId;
+      const sessionId =
+        typeof req.query.sessionId === "string" ? req.query.sessionId : "";
 
-      if (typeof sessionId !== "string" || !sessionId || !stripe) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid checkout session.",
-        });
-      }
+      const filter = { vendorId: new ObjectId(req.user.id) };
+      if (sessionId) filter.stripeSessionId = sessionId;
 
-      const session = await stripe.checkout.sessions.retrieve(sessionId);
-
-      const paid =
-        session.payment_status === "paid" ||
-        session.payment_status === "no_payment_required";
-
-      if (
-        !paid ||
-        !session.subscription ||
-        session.metadata?.vendorId !== req.user.id
-      ) {
-        return res.status(400).json({
-          success: false,
-          message: "Payment has not been completed for this account.",
-        });
-      }
-
-      await userCollection.updateOne(
-        { _id: new ObjectId(req.user.id) },
-        { $set: { subscriptionPlan: "premium", subscriptionExpiresAt: null } }
-      );
-      await recordPremiumPayment(session, req.user.id);
+      const transaction = await transactionsCollection.findOne(filter, {
+        sort: { createdAt: -1 },
+      });
 
       return res.json({
         success: true,
-        message: "Premium plan activated.",
+        plan: isPremium(req.user) ? "premium" : "free",
+        transaction: transaction
+          ? {
+              plan: transaction.plan,
+              amount: transaction.amount,
+              currency: transaction.currency,
+              status: transaction.status,
+              createdAt: transaction.createdAt,
+            }
+          : null,
       });
     } catch (error) {
-      console.error("Payment verification failed:", error);
+      console.error("Fetch subscription status failed:", error);
       return res.status(500).json({
         success: false,
-        message: "Could not verify your payment. Please try again.",
+        message: "Could not load your payment status. Please try again.",
       });
     }
   }
@@ -836,8 +878,13 @@ app.patch(
 // Vendor booking requests — only this vendor's bookings
 app.get("/vendor/bookings", verifyToken, verifyVendor, async (req, res) => {
   try {
+    // Only requests that still need the vendor's attention (or are confirmed).
+    // Rejected/cancelled requests are history, not part of this action queue.
     const bookings = await bookingsCollection
-      .find({ vendorId: new ObjectId(req.user.id) })
+      .find({
+        vendorId: new ObjectId(req.user.id),
+        status: { $in: ["pending", "accepted"] },
+      })
       .sort({ createdAt: -1 })
       .toArray();
 
@@ -1204,7 +1251,7 @@ app.get("/admin/transactions", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const transactions = await transactionsCollection
       .find({})
-      .sort({ transactionDate: -1 })
+      .sort({ createdAt: -1 })
       .toArray();
 
     const vendorIds = [
@@ -1232,9 +1279,16 @@ app.get("/admin/transactions", verifyToken, verifyAdmin, async (req, res) => {
       transactions: transactions.map((transaction) => {
         const vendor = vendorMap.get(transaction.vendorId?.toString());
         return {
-          ...serializeTransaction(transaction),
+          id: transaction._id.toString(),
+          vendorId: transaction.vendorId?.toString() ?? null,
           vendorName: vendor?.businessName || vendor?.name || "Unknown vendor",
           vendorEmail: vendor?.email ?? null,
+          plan: transaction.plan ?? transaction.subscriptionPlan ?? "premium",
+          amount: transaction.amount ?? 0,
+          currency: transaction.currency ?? "usd",
+          status: transaction.status ?? transaction.paymentStatus ?? "pending",
+          createdAt:
+            transaction.createdAt ?? transaction.transactionDate ?? null,
         };
       }),
     });
@@ -1344,7 +1398,9 @@ app.post("/bookings", verifyToken, verifyCustomer, async (req, res) => {
 
     const service = await servicesCollection.findOne({
       _id: new ObjectId(value.serviceId),
-      status: "approved",
+      // Pending services are browsable, so customers may request them too.
+      // Rejected or paused services can never be booked.
+      status: { $in: ["pending", "approved"] },
       isActive: true,
     });
 
@@ -1369,17 +1425,14 @@ app.post("/bookings", verifyToken, verifyCustomer, async (req, res) => {
     const customerId = new ObjectId(req.user.id);
 
     // Reject a second active request for the same service and event date.
-    const dayStart = new Date(`${eventDateKey}T00:00:00.000Z`);
-    const dayEnd = new Date(`${eventDateKey}T23:59:59.999Z`);
     const duplicate = await bookingsCollection.findOne({
       customerId,
       serviceId: service._id,
       $or: [
-        { isActiveRequest: true, eventDateKey },
+        { isActiveRequest: true },
         {
           isActiveRequest: { $exists: false },
           status: { $in: ["pending", "accepted"] },
-          eventDate: { $gte: dayStart, $lte: dayEnd },
         },
       ],
     });
@@ -1388,7 +1441,7 @@ app.post("/bookings", verifyToken, verifyCustomer, async (req, res) => {
       return res.status(409).json({
         success: false,
         message:
-          "You already have an active booking request for this service on that date.",
+          "You already have an active booking request for this service. Cancel it before requesting again.",
       });
     }
 
@@ -1432,7 +1485,7 @@ app.post("/bookings", verifyToken, verifyCustomer, async (req, res) => {
       return res.status(409).json({
         success: false,
         message:
-          "You already have an active booking request for this service on that date.",
+          "You already have an active booking request for this service. Cancel it before requesting again.",
       });
     }
 
@@ -1490,10 +1543,9 @@ app.get("/customer/bookings", verifyToken, verifyCustomer, async (req, res) => {
   }
 });
 
-// Cancel a pending booking. The filter guarantees all three rules at once:
-// it must belong to this customer AND still be pending. Anything else (a
-// processed booking, or another customer's booking) simply doesn't match.
-app.patch(
+// Cancelling deletes the pending booking outright. The ownership + pending
+// filter means another customer's booking or a processed one can't be removed.
+app.delete(
   "/customer/bookings/:id/cancel",
   verifyToken,
   verifyCustomer,
@@ -1508,23 +1560,13 @@ app.patch(
         });
       }
 
-      const result = await bookingsCollection.findOneAndUpdate(
-        {
-          _id: new ObjectId(id),
-          customerId: new ObjectId(req.user.id),
-          status: "pending",
-        },
-        {
-          $set: {
-            status: "cancelled",
-            isActiveRequest: false,
-            updatedAt: new Date(),
-          },
-        },
-        { returnDocument: "after" }
-      );
+      const result = await bookingsCollection.deleteOne({
+        _id: new ObjectId(id),
+        customerId: new ObjectId(req.user.id),
+        status: "pending",
+      });
 
-      if (!result) {
+      if (result.deletedCount === 0) {
         return res.status(409).json({
           success: false,
           message:
@@ -1534,8 +1576,7 @@ app.patch(
 
       return res.json({
         success: true,
-        message: "Booking request cancelled.",
-        booking: serializeBooking(result),
+        message: "Booking request cancelled and removed.",
       });
     } catch (error) {
       console.error("Cancel booking failed:", error);
