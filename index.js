@@ -54,6 +54,7 @@ app.post(
           { _id: new ObjectId(vendorId) },
           { $set: { subscriptionPlan: "premium", subscriptionExpiresAt: null } }
         );
+        await recordPremiumPayment(session, vendorId);
       }
     }
 
@@ -101,7 +102,18 @@ await servicesCollection.createIndex({ status: 1, isActive: 1 });
 await bookingsCollection.createIndex({ vendorId: 1, status: 1, createdAt: -1 });
 await bookingsCollection.createIndex({ customerId: 1, createdAt: -1 });
 await bookingsCollection.createIndex({ serviceId: 1 });
+// One active request per customer + service + event date. Cancelled/rejected
+// requests are excluded from this unique index via isActiveRequest.
+await bookingsCollection.createIndex(
+  { customerId: 1, serviceId: 1, eventDateKey: 1 },
+  { unique: true, partialFilterExpression: { isActiveRequest: true } }
+);
 await transactionsCollection.createIndex({ bookingId: 1, createdAt: -1 });
+await transactionsCollection.createIndex(
+  { stripeSessionId: 1 },
+  { unique: true, sparse: true }
+);
+await userCollection.createIndex({ role: 1 });
 
 // ========================================
 // JWT Authentication Configuration
@@ -380,6 +392,42 @@ function serializeBooking(booking) {
   };
 }
 
+function serializeTransaction(transaction) {
+  const { _id, ...rest } = transaction;
+  return {
+    ...rest,
+    id: _id.toString(),
+    vendorId: transaction.vendorId?.toString() ?? null,
+  };
+}
+
+// Records a successful Premium payment exactly once — webhook and the
+// success-page verification can both call this safely.
+async function recordPremiumPayment(session, vendorId) {
+  await transactionsCollection.updateOne(
+    { stripeSessionId: session.id },
+    {
+      $setOnInsert: {
+        vendorId: new ObjectId(vendorId),
+        subscriptionPlan: "premium",
+        amount: session.amount_total ?? 0,
+        currency: session.currency ?? "usd",
+        paymentStatus: "paid",
+        transactionDate: new Date(),
+        stripeSessionId: session.id,
+        stripeSubscriptionId:
+          typeof session.subscription === "string"
+            ? session.subscription
+            : (session.subscription?.id ?? null),
+        customerEmail:
+          session.customer_email ?? session.customer_details?.email ?? null,
+        createdAt: new Date(),
+      },
+    },
+    { upsert: true }
+  );
+}
+
 function isPremium(user) {
   return user?.subscriptionPlan === "premium";
 }
@@ -606,6 +654,7 @@ app.get(
         { _id: new ObjectId(req.user.id) },
         { $set: { subscriptionPlan: "premium", subscriptionExpiresAt: null } }
       );
+      await recordPremiumPayment(session, req.user.id);
 
       return res.json({
         success: true,
@@ -832,7 +881,14 @@ app.patch(
           vendorId: new ObjectId(req.user.id),
           status: "pending",
         },
-        { $set: { status, updatedAt: new Date() } },
+        {
+          $set: {
+            status,
+            // Accepted still counts as active; rejected frees the date slot.
+            isActiveRequest: status === "accepted",
+            updatedAt: new Date(),
+          },
+        },
         { returnDocument: "after" }
       );
 
@@ -858,11 +914,25 @@ app.patch(
   }
 );
 
-// Admin moderation: every service, newest first
+// Admin moderation: every service, newest first, with backend search/filter
 app.get("/admin/services", verifyToken, verifyAdmin, async (req, res) => {
   try {
+    const queryValue = (key) =>
+      typeof req.query[key] === "string" ? req.query[key].trim() : "";
+
+    const search = queryValue("search");
+    const category = queryValue("category");
+    const status = queryValue("status");
+    const location = queryValue("location");
+
+    const filter = {};
+    if (search) filter.serviceName = { $regex: escapeRegex(search), $options: "i" };
+    if (category && SERVICE_CATEGORIES.includes(category)) filter.category = category;
+    if (["pending", "approved", "rejected"].includes(status)) filter.status = status;
+    if (location) filter.location = { $regex: escapeRegex(location), $options: "i" };
+
     const services = await servicesCollection
-      .find({})
+      .find(filter)
       .sort({ createdAt: -1 })
       .toArray();
 
@@ -951,6 +1021,231 @@ app.patch(
     }
   }
 );
+
+// Delete an inappropriate service (and its booking requests)
+app.delete("/admin/services/:id", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid service id." });
+    }
+
+    const objectId = new ObjectId(id);
+    const result = await servicesCollection.deleteOne({ _id: objectId });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ success: false, message: "Service not found." });
+    }
+
+    await bookingsCollection.deleteMany({ serviceId: objectId });
+
+    return res.json({ success: true, message: "Service deleted." });
+  } catch (error) {
+    console.error("Admin delete service failed:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Could not delete the service. Please try again.",
+    });
+  }
+});
+
+function serializeUser(user) {
+  const { _id, ...rest } = user;
+  return {
+    ...rest,
+    id: _id.toString(),
+    isBlocked: Boolean(user.isBlocked),
+    subscriptionPlan: user.subscriptionPlan ?? "free",
+  };
+}
+
+// Admin overview counters
+app.get("/admin/stats", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const [totalUsers, totalVendors, totalCustomers, totalServices, pendingServices, totalTransactions] =
+      await Promise.all([
+        userCollection.countDocuments({}),
+        userCollection.countDocuments({ role: "vendor" }),
+        userCollection.countDocuments({ role: "customer" }),
+        servicesCollection.countDocuments({}),
+        servicesCollection.countDocuments({ status: "pending" }),
+        transactionsCollection.countDocuments({}),
+      ]);
+
+    return res.json({
+      success: true,
+      stats: {
+        totalUsers,
+        totalVendors,
+        totalCustomers,
+        totalServices,
+        pendingServices,
+        totalTransactions,
+      },
+    });
+  } catch (error) {
+    console.error("Fetch admin stats failed:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Could not load admin dashboard. Please try again.",
+    });
+  }
+});
+
+// All registered users with backend search + role filter
+app.get("/admin/users", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const queryValue = (key) =>
+      typeof req.query[key] === "string" ? req.query[key].trim() : "";
+
+    const search = queryValue("search");
+    const role = queryValue("role");
+
+    const filter = {};
+    if (search) {
+      filter.$or = [
+        { name: { $regex: escapeRegex(search), $options: "i" } },
+        { email: { $regex: escapeRegex(search), $options: "i" } },
+      ];
+    }
+    if (["admin", "vendor", "customer"].includes(role)) filter.role = role;
+
+    const users = await userCollection
+      .find(filter, {
+        projection: {
+          name: 1,
+          email: 1,
+          role: 1,
+          isBlocked: 1,
+          businessName: 1,
+          subscriptionPlan: 1,
+          image: 1,
+          createdAt: 1,
+        },
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    return res.json({ success: true, users: users.map(serializeUser) });
+  } catch (error) {
+    console.error("Fetch admin users failed:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Could not load users. Please try again.",
+    });
+  }
+});
+
+// Block / unblock a user. Blocked users are rejected by verifyToken on
+// every protected API request and by the client dashboard guard.
+app.patch(
+  "/admin/users/:id/block",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const isBlocked = req.body?.isBlocked;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ success: false, message: "Invalid user id." });
+      }
+      if (typeof isBlocked !== "boolean") {
+        return res.status(400).json({
+          success: false,
+          message: "isBlocked must be a boolean.",
+        });
+      }
+      if (id === req.user.id) {
+        return res.status(400).json({
+          success: false,
+          message: "You cannot change your own account status.",
+        });
+      }
+
+      const target = await userCollection.findOne(
+        { _id: new ObjectId(id) },
+        { projection: { role: 1 } }
+      );
+
+      if (!target) {
+        return res.status(404).json({ success: false, message: "User not found." });
+      }
+      if (target.role === "admin") {
+        return res.status(403).json({
+          success: false,
+          message: "Admin accounts cannot be blocked.",
+        });
+      }
+
+      const result = await userCollection.findOneAndUpdate(
+        { _id: new ObjectId(id) },
+        { $set: { isBlocked } },
+        { returnDocument: "after" }
+      );
+
+      return res.json({
+        success: true,
+        message: isBlocked ? "User blocked." : "User unblocked.",
+        user: serializeUser(result),
+      });
+    } catch (error) {
+      console.error("Update user block status failed:", error);
+      return res.status(500).json({
+        success: false,
+        message: "Could not update the user. Please try again.",
+      });
+    }
+  }
+);
+
+// Read-only payment records — no endpoint can alter a payment result.
+app.get("/admin/transactions", verifyToken, verifyAdmin, async (req, res) => {
+  try {
+    const transactions = await transactionsCollection
+      .find({})
+      .sort({ transactionDate: -1 })
+      .toArray();
+
+    const vendorIds = [
+      ...new Set(
+        transactions
+          .map((item) => item.vendorId)
+          .filter((value) => value instanceof ObjectId)
+          .map((value) => value.toString())
+      ),
+    ];
+
+    const vendors = vendorIds.length
+      ? await userCollection
+          .find(
+            { _id: { $in: vendorIds.map((id) => new ObjectId(id)) } },
+            { projection: { name: 1, businessName: 1, email: 1 } }
+          )
+          .toArray()
+      : [];
+
+    const vendorMap = new Map(vendors.map((vendor) => [vendor._id.toString(), vendor]));
+
+    return res.json({
+      success: true,
+      transactions: transactions.map((transaction) => {
+        const vendor = vendorMap.get(transaction.vendorId?.toString());
+        return {
+          ...serializeTransaction(transaction),
+          vendorName: vendor?.businessName || vendor?.name || "Unknown vendor",
+          vendorEmail: vendor?.email ?? null,
+        };
+      }),
+    });
+  } catch (error) {
+    console.error("Fetch admin transactions failed:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Could not load transactions. Please try again.",
+    });
+  }
+});
 
 function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1070,20 +1365,57 @@ app.post("/bookings", verifyToken, verifyCustomer, async (req, res) => {
       });
     }
 
+    const eventDateKey = value.eventDate.toISOString().slice(0, 10);
+    const customerId = new ObjectId(req.user.id);
+
+    // Reject a second active request for the same service and event date.
+    const dayStart = new Date(`${eventDateKey}T00:00:00.000Z`);
+    const dayEnd = new Date(`${eventDateKey}T23:59:59.999Z`);
+    const duplicate = await bookingsCollection.findOne({
+      customerId,
+      serviceId: service._id,
+      $or: [
+        { isActiveRequest: true, eventDateKey },
+        {
+          isActiveRequest: { $exists: false },
+          status: { $in: ["pending", "accepted"] },
+          eventDate: { $gte: dayStart, $lte: dayEnd },
+        },
+      ],
+    });
+
+    if (duplicate) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "You already have an active booking request for this service on that date.",
+      });
+    }
+
+    const vendor = await userCollection.findOne(
+      { _id: service.vendorId },
+      { projection: { name: 1, businessName: 1, image: 1 } }
+    );
+
     const now = new Date();
     const booking = {
       serviceId: service._id,
       vendorId: service.vendorId,
-      customerId: new ObjectId(req.user.id),
+      customerId,
       customerName: req.user.name,
       customerEmail: req.user.email,
       serviceName: service.serviceName,
       serviceImage: service.images?.[0] ?? null,
+      vendorName: vendor?.name ?? null,
+      vendorBusinessName: vendor?.businessName ?? null,
+      vendorImage: vendor?.image ?? null,
       price: service.price,
       eventDate: value.eventDate,
+      eventDateKey,
       eventLocation: value.eventLocation,
       message: value.message,
       status: "pending",
+      isActiveRequest: true,
       createdAt: now,
       updatedAt: now,
     };
@@ -1096,10 +1428,43 @@ app.post("/bookings", verifyToken, verifyCustomer, async (req, res) => {
       booking: serializeBooking({ ...booking, _id: result.insertedId }),
     });
   } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(409).json({
+        success: false,
+        message:
+          "You already have an active booking request for this service on that date.",
+      });
+    }
+
     console.error("Create booking failed:", error);
     return res.status(500).json({
       success: false,
       message: "Could not send your booking request. Please try again.",
+    });
+  }
+});
+
+// Customer dashboard counters
+app.get("/customer/stats", verifyToken, verifyCustomer, async (req, res) => {
+  try {
+    const customerId = new ObjectId(req.user.id);
+
+    const [total, pending, accepted, rejected] = await Promise.all([
+      bookingsCollection.countDocuments({ customerId }),
+      bookingsCollection.countDocuments({ customerId, status: "pending" }),
+      bookingsCollection.countDocuments({ customerId, status: "accepted" }),
+      bookingsCollection.countDocuments({ customerId, status: "rejected" }),
+    ]);
+
+    return res.json({
+      success: true,
+      stats: { total, pending, accepted, rejected },
+    });
+  } catch (error) {
+    console.error("Fetch customer stats failed:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Could not load your dashboard. Please try again.",
     });
   }
 });
@@ -1125,7 +1490,62 @@ app.get("/customer/bookings", verifyToken, verifyCustomer, async (req, res) => {
   }
 });
 
+// Cancel a pending booking. The filter guarantees all three rules at once:
+// it must belong to this customer AND still be pending. Anything else (a
+// processed booking, or another customer's booking) simply doesn't match.
+app.patch(
+  "/customer/bookings/:id/cancel",
+  verifyToken,
+  verifyCustomer,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
 
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid booking id.",
+        });
+      }
+
+      const result = await bookingsCollection.findOneAndUpdate(
+        {
+          _id: new ObjectId(id),
+          customerId: new ObjectId(req.user.id),
+          status: "pending",
+        },
+        {
+          $set: {
+            status: "cancelled",
+            isActiveRequest: false,
+            updatedAt: new Date(),
+          },
+        },
+        { returnDocument: "after" }
+      );
+
+      if (!result) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "This request was not found or can no longer be cancelled.",
+        });
+      }
+
+      return res.json({
+        success: true,
+        message: "Booking request cancelled.",
+        booking: serializeBooking(result),
+      });
+    } catch (error) {
+      console.error("Cancel booking failed:", error);
+      return res.status(500).json({
+        success: false,
+        message: "Could not cancel your request. Please try again.",
+      });
+    }
+  }
+);
 
 // ========================================
 // Fallback error / 404 handlers
