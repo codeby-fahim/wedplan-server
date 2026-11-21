@@ -797,11 +797,37 @@ app.patch(
   }
 );
 
-// Public discovery: only approved, active services
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Public discovery: only approved, active services.
+// Search, category and location filtering all happen here in the database.
 app.get("/services", async (req, res) => {
   try {
+    const queryValue = (key) =>
+      typeof req.query[key] === "string" ? req.query[key].trim() : "";
+
+    const search = queryValue("search");
+    const location = queryValue("location");
+    const requestedCategory = queryValue("category");
+
+    // Show everything vendors have published except rejected services.
+    // Pending listings are visible but cannot be booked until approved.
+    const filter = { status: { $in: ["pending", "approved"] }, isActive: true };
+
+    if (search) {
+      filter.serviceName = { $regex: escapeRegex(search), $options: "i" };
+    }
+    if (SERVICE_CATEGORIES.includes(requestedCategory)) {
+      filter.category = requestedCategory;
+    }
+    if (location) {
+      filter.location = { $regex: escapeRegex(location), $options: "i" };
+    }
+
     const services = await servicesCollection
-      .find({ status: "approved", isActive: true })
+      .find(filter)
       .sort({ createdAt: -1 })
       .limit(50)
       .toArray();
@@ -819,7 +845,7 @@ app.get("/services", async (req, res) => {
   }
 });
 
-// Public service detail — never exposes pending/rejected/inactive services
+// Public service detail — rejected and paused services stay hidden
 app.get("/services/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -829,12 +855,15 @@ app.get("/services/:id", async (req, res) => {
 
     const service = await servicesCollection.findOne({
       _id: new ObjectId(id),
-      status: "approved",
+      status: { $in: ["pending", "approved"] },
       isActive: true,
     });
 
     if (!service) {
-      return res.status(404).json({ success: false, message: "Service not found." });
+      return res.status(404).json({
+        success: false,
+        message: "Service not found or no longer available.",
+      });
     }
 
     return res.json({ success: true, service: await withVendorInfo(service) });
