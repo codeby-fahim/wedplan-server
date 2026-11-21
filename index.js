@@ -1735,8 +1735,12 @@ app.use((error, req, res, next) => {
 // Server Start
 // ========================================
 
-app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
-});
+// On Vercel the exported app is invoked by the serverless runtime; calling
+// listen() there would try to bind a port that doesn't exist.
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`Server is running on http://localhost:${PORT}`);
+  });
+}
 
 export default app;
