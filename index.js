@@ -439,7 +439,7 @@ function validateServicePayload(body) {
   };
 }
 
-const FREE_PLAN_ACTIVE_LIMIT = 3;
+const FREE_PLAN_SERVICE_LIMIT = 3;
 
 function serializeBooking(booking) {
   const { _id, ...rest } = booking;
@@ -554,6 +554,14 @@ function isPremium(user) {
   return user?.subscriptionPlan === "premium";
 }
 
+// Free plan allows at most 3 services in total, regardless of approval
+// status — pending and approved both count toward the limit.
+async function countVendorServices(vendorId) {
+  return servicesCollection.countDocuments({
+    vendorId: new ObjectId(vendorId),
+  });
+}
+
 async function countActiveServices(vendorId) {
   return servicesCollection.countDocuments({
     vendorId: new ObjectId(vendorId),
@@ -602,11 +610,11 @@ app.post("/add-service", verifyToken, verifyVendor, async (req, res) => {
     }
 
     if (!isPremium(req.user)) {
-      const activeCount = await countActiveServices(req.user.id);
-      if (activeCount >= FREE_PLAN_ACTIVE_LIMIT) {
+      const serviceCount = await countVendorServices(req.user.id);
+      if (serviceCount >= FREE_PLAN_SERVICE_LIMIT) {
         return res.status(403).json({
           success: false,
-          message: `Free plan allows up to ${FREE_PLAN_ACTIVE_LIMIT} active services. Upgrade to Premium to publish more.`,
+          message: `Free plan allows up to ${FREE_PLAN_SERVICE_LIMIT} services. Upgrade to Premium to publish more.`,
         });
       }
     }
@@ -684,7 +692,7 @@ app.get("/vendor/stats", verifyToken, verifyVendor, async (req, res) => {
         pendingBookings,
         acceptedBookings,
         subscriptionPlan: isPremium(req.user) ? "premium" : "free",
-        activeServiceLimit: isPremium(req.user) ? null : FREE_PLAN_ACTIVE_LIMIT,
+        activeServiceLimit: isPremium(req.user) ? null : FREE_PLAN_SERVICE_LIMIT,
       },
     });
   } catch (error) {
@@ -1008,16 +1016,6 @@ app.patch(
         return res.status(404).json({ success: false, message: "Service not found." });
       }
 
-      if (isActive && !service.isActive && !isPremium(req.user)) {
-        const activeCount = await countActiveServices(req.user.id);
-        if (activeCount >= FREE_PLAN_ACTIVE_LIMIT) {
-          return res.status(403).json({
-            success: false,
-            message: `Free plan allows up to ${FREE_PLAN_ACTIVE_LIMIT} active services. Upgrade to Premium to publish more.`,
-          });
-        }
-      }
-
       const result = await servicesCollection.findOneAndUpdate(
         { _id: new ObjectId(id), vendorId: new ObjectId(req.user.id) },
         { $set: { isActive, updatedAt: new Date() } },
@@ -1196,22 +1194,6 @@ app.patch(
           success: false,
           message: "Service not found.",
         });
-      }
-
-      // Do not let approval bypass the vendor's free-plan limit.
-      if (status === "approved" && existing.status !== "approved") {
-        const vendor = await userCollection.findOne({ _id: existing.vendorId });
-        if (vendor?.subscriptionPlan !== "premium") {
-          const activeCount = await countActiveServices(
-            existing.vendorId.toString()
-          );
-          if (activeCount >= FREE_PLAN_ACTIVE_LIMIT) {
-            return res.status(409).json({
-              success: false,
-              message: `This vendor already has ${FREE_PLAN_ACTIVE_LIMIT} active services on the free plan.`,
-            });
-          }
-        }
       }
 
       const result = await servicesCollection.findOneAndUpdate(
