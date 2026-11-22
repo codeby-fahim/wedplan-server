@@ -731,24 +731,44 @@ app.post(
         cancel_url: `${CLIENT_ORIGIN}/dashboard/vendor/subscription/cancel`,
       });
 
-      // Record a pending transaction. Only a verified webhook can move it
-      // to "paid" — the browser redirect has no power over this record.
-      await transactionsCollection.updateOne(
-        { stripeSessionId: session.id },
-        {
-          $setOnInsert: {
-            vendorId: new ObjectId(req.user.id),
-            plan: "premium",
-            amount: 999,
-            currency: "bdt",
-            stripeSessionId: session.id,
-            stripeSubscriptionId: null,
-            status: "pending",
-            createdAt: new Date(),
-          },
-        },
-        { upsert: true }
-      );
+      // Keep ONE pending record per vendor. Repeated checkout attempts reuse
+      // and update it instead of piling up stale pending rows. Only a verified
+      // webhook can later move it to "paid".
+      const pending = await transactionsCollection.findOne({
+        vendorId: new ObjectId(req.user.id),
+        status: "pending",
+      });
+
+      if (pending) {
+        await transactionsCollection.updateOne(
+          { _id: pending._id },
+          {
+            $set: {
+              stripeSessionId: session.id,
+              stripeSubscriptionId: null,
+              createdAt: new Date(),
+            },
+          }
+        );
+      } else {
+        await transactionsCollection.insertOne({
+          vendorId: new ObjectId(req.user.id),
+          plan: "premium",
+          amount: 999,
+          currency: "bdt",
+          stripeSessionId: session.id,
+          stripeSubscriptionId: null,
+          status: "pending",
+          createdAt: new Date(),
+        });
+      }
+
+      // Remove any older abandoned pending rows for this vendor.
+      await transactionsCollection.deleteMany({
+        vendorId: new ObjectId(req.user.id),
+        status: "pending",
+        stripeSessionId: { $ne: session.id },
+      });
 
       return res.json({ success: true, url: session.url });
     } catch (error) {
