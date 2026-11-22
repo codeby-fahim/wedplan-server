@@ -784,6 +784,57 @@ app.post(
   }
 );
 
+// Secure fallback for missed webhook deliveries. This does NOT trust the
+// browser: it fetches the session from Stripe with the secret key and only
+// activates a plan when Stripe says it is paid AND the session metadata
+// belongs to the authenticated vendor.
+app.post(
+  "/vendor/subscription/confirm",
+  verifyToken,
+  verifyVendor,
+  async (req, res) => {
+    try {
+      const sessionId = req.body?.sessionId;
+
+      if (typeof sessionId !== "string" || !sessionId || !stripe) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid checkout session.",
+        });
+      }
+
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      const paid =
+        session.payment_status === "paid" ||
+        session.payment_status === "no_payment_required";
+
+      if (
+        !paid ||
+        !session.subscription ||
+        session.metadata?.vendorId !== req.user.id
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Payment has not been completed for this account.",
+        });
+      }
+
+      await activatePremium(req.user.id, session);
+
+      return res.json({
+        success: true,
+        message: "Payment confirmed. Premium plan activated.",
+      });
+    } catch (error) {
+      console.error("Payment confirmation failed:", error);
+      return res.status(500).json({
+        success: false,
+        message: "Could not confirm your payment. Please try again.",
+      });
+    }
+  }
+);
+
 // Read-only status for the success page. This never changes a plan or a
 // transaction — it only reports what webhooks have already confirmed.
 app.get(
